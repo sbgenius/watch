@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Video</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;color-scheme:dark}
+video{position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000;outline:none}
+.overlay{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1rem;padding:2rem;text-align:center;color:#a7a7b5;font:500 .95rem/1.5 system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;pointer-events:none}
+.overlay.hidden{display:none}
+.overlay.err{color:#ff7a88}
+.spinner{width:34px;height:34px;border:3px solid rgba(255,255,255,.14);border-top-color:#ff3d54;border-radius:50%;animation:spin .7s linear infinite}
+.overlay.err .spinner{display:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spinner{animation-duration:2s}}
+</style>
+</head>
+<body>
+
+<video id="video" controls playsinline autoplay></video>
+<div class="overlay" id="overlay" role="status"><div class="spinner"></div><div id="msg"></div></div>
+
+<script>
+'use strict';
+/* ====== config (keep in sync with uploader.py / index.html) ====== */
+const WORKER = 'https://streamer.shreyasgokhale200.workers.dev';
+const PASS = 'backyard';
+const PBKDF2_ITERS = 200000;
+const AHEAD = 4, BEHIND = 2;
+
+/*  Link formats (nothing is stored; the link is the whole state):
+      watch.html?v=<video id>            direct, fastest (no library lookup)
+      watch.html?v=<video id>&t=1:23:45  start at a time (h:mm:ss, m:ss or seconds)
+      watch.html#/Folder/Sub/Video       same path style as index.html links
+      watch.html?p=/Folder/Sub/Video     path style, query form                      */
+
+const $ = (s) => document.querySelector(s);
+const enc = new TextEncoder(), dec = new TextDecoder();
+const video = $('#video'), overlay = $('#overlay'), msg = $('#msg');
+
+/* ====== overlay ====== */
+function showLoading(text) { overlay.className = 'overlay'; msg.textContent = text || ''; }
+function showError(text) { overlay.className = 'overlay err'; msg.textContent = text; }
+function hideOverlay() { overlay.classList.add('hidden'); }
+video.addEventListener('playing', hideOverlay);
+video.addEventListener('canplay', hideOverlay);
+video.addEventListener('waiting', () => { if (S && S.man) showLoading(''); });
+
+/* ====== crypto ====== */
+async function deriveKey(pass, salt) {
+  const base = await crypto.subtle.importKey('raw', enc.encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERS, hash: 'SHA-256' },
+    base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+}
+// salt(16) || iv(12) || ct || tag  (index.bin, manifest.bin)
+async function decryptSalted(pass, name, buf) {
+  const u = new Uint8Array(buf);
+  const key = await deriveKey(pass, u.slice(0, 16));
+  const pt = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: u.slice(16, 28), additionalData: enc.encode(name) }, key, u.slice(28));
+  return { key, pt };
+}
+// iv(12) || ct || tag  (init.bin, seg_*.bin)
+function decryptChunk(key, name, buf) {
+  const u = new Uint8Array(buf);
+  return crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: u.slice(0, 12), additionalData: enc.encode(name) }, key, u.slice(12));
+}
+
+/* ====== link parsing ====== */
+function splitPath(s) {
+  return s.split('/').filter(Boolean).map((x) => { try { return decodeURIComponent(x); } catch { return x; } });
+}
+function parseTime(s) {
+  const p = String(s || '').trim().split(':').map(Number);
+  if (!p.length || p.length > 3 || p.some((x) => !isFinite(x) || x < 0)) return 0;
+  return p.reduce((a, x) => a * 60 + x, 0);
+}
+function readLink() {
+  const q = new URLSearchParams(location.search);
+  const h = location.hash.replace(/^#/, '');
+  let id = q.get('v'), path = null;
+  if (!id) {
+    if (q.get('p')) path = splitPath(q.get('p'));
+    else if (h.startsWith('/')) path = splitPath(h);
+    else if (h) { try { id = decodeURIComponent(h); } catch { id = h; } }
+  }
+  return { id, path, t: parseTime(q.get('t')) };
+}
+
+/* ====== library lookup (only needed for path-style links) ====== */
+async function findByPath(path) {
+  let r;
+  try { r = await fetch(WORKER + '/index', { cache: 'no-store' }); }
+  catch { throw new Error('Could not reach the server. Check your connection.'); }
+  if (!r.ok) throw new Error(`The server returned an error (${r.status}).`);
+  let tree;
+  try {
+    const { pt } = await decryptSalted(PASS, 'index.bin', await r.arrayBuffer());
+    tree = JSON.parse(dec.decode(pt)).tree;
+  } catch { throw new Error('Could not decrypt the library.'); }
+  let n = tree;
+  for (const name of path) {
+    n = n && n.type === 'folder' ? n.children.find((c) => c.name === name) : null;
+    if (!n) throw new Error('Video not found. The link may be wrong or the video was removed.');
+  }
+  if (n.type === 'folder') throw new Error('This link points to a folder, not a video.');
+  return n;
+}
+
+/* ====== playback ====== */
+let S = null;
+const relTag = (id, p) => (p ? `${id}-${p}` : id);   // part 0 keeps the plain tag
+
+async function fetchBuf(url, signal) {
+  const r = await fetch(url, { signal });
+  if (!r.ok) throw new Error(`Download failed (${r.status})`);
+  return r.arrayBuffer();
+}
+
+function sbOp(sess, fn) {
+  const p = sess.chain.then(fn);
+  sess.chain = p.catch(() => {});
+  return p;
+}
+function sbWait(sb, action) {
+  return new Promise((resolve, reject) => {
+    const off = () => { sb.removeEventListener('updateend', ok); sb.removeEventListener('error', bad); };
+    const ok = () => { off(); resolve(); };
+    const bad = () => { off(); reject(new Error('Video buffer error')); };
+    sb.addEventListener('updateend', ok); sb.addEventListener('error', bad);
+    try { action(); } catch (e) { off(); reject(e); }
+  });
+}
+
+async function openVideo(id, startAt) {
+  const sess = { id, dead: false, have: new Set(), inflight: null, pumping: false, again: false };
+  S = sess;
+  showLoading('');
+  try {
+    let r;
+    try { r = await fetch(`${WORKER}/r/${encodeURIComponent(id)}/manifest.bin`); }
+    catch { throw new Error('Could not reach the server. Check your connection.'); }
+    if (r.status === 404) throw new Error('Video not found. The link may be wrong or the video was removed.');
+    if (!r.ok) throw new Error(`The server returned an error (${r.status}).`);
+    let man, key;
+    try {
+      const d = await decryptSalted(PASS, 'manifest.bin', await r.arrayBuffer());
+      key = d.key; man = JSON.parse(dec.decode(d.pt));
+    } catch { throw new Error('Could not decrypt this video.'); }
+
+    if (!window.MediaSource || !MediaSource.isTypeSupported(man.mime))
+      throw new Error('This browser cannot play this video format (needs Media Source Extensions).');
+    Object.assign(sess, { man, key, segs: man.segments, ms: new MediaSource() });
+    sess.url = URL.createObjectURL(sess.ms);
+    video.src = sess.url;
+    await new Promise((res) => sess.ms.addEventListener('sourceopen', res, { once: true }));
+    sess.ms.duration = man.duration;
+    sess.sb = sess.ms.addSourceBuffer(man.mime);
+    sess.sb.mode = 'segments';
+    sess.chain = Promise.resolve();
+
+    const initBuf = await decryptChunk(key, man.init, await fetchBuf(`${WORKER}/r/${relTag(id, man.init_part || 0)}/${man.init}`));
+    await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.appendBuffer(initBuf)));
+
+    if (startAt > 0 && startAt < man.duration - 1) video.currentTime = startAt;
+    pump();
+    video.play().catch(() => {});   // may be blocked by the browser until the first tap; the controls still work
+  } catch (e) {
+    if (!sess.dead) showError(e.message || 'Playback error');
+  }
+}
+
+function idxAt(t) {
+  const segs = S.segs; let lo = 0, hi = segs.length - 1;
+  while (lo < hi) { const m = (lo + hi + 1) >> 1; if (segs[m].start <= t) lo = m; else hi = m - 1; }
+  return lo;
+}
+function windowFor(cur) { return [Math.max(0, cur - BEHIND), Math.min(S.segs.length - 1, cur + AHEAD)]; }
+
+async function evict(sess, lo, hi) {
+  for (const i of [...sess.have]) {
+    if (i >= lo && i <= hi) continue;
+    const s = sess.segs[i];
+    try { await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.remove(s.start, s.start + s.dur))); } catch {}
+    sess.have.delete(i);
+  }
+}
+
+async function appendSeg(sess, i, data) {
+  try { await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.appendBuffer(data))); }
+  catch (e) {
+    if (e.name !== 'QuotaExceededError') throw e;
+    const [lo, hi] = windowFor(idxAt(video.currentTime));
+    await evict(sess, Math.max(lo, i - 1), Math.min(hi, i + 1));   // tighten, then retry once
+    await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.appendBuffer(data)));
+  }
+}
+
+async function pump() {
+  const sess = S;
+  if (!sess || !sess.sb) return;
+  if (sess.pumping) { sess.again = true; return; }
+  sess.pumping = true;
+  try {
+    do {
+      sess.again = false;
+      const cur = idxAt(video.currentTime), [lo, hi] = windowFor(cur);
+      await evict(sess, lo, hi);
+      const order = [cur];
+      for (let i = cur + 1; i <= hi; i++) order.push(i);
+      for (let i = cur - 1; i >= lo; i--) order.push(i);
+      for (const i of order) {
+        if (sess.dead || sess.again) break;
+        if (sess.have.has(i)) continue;
+        const seg = sess.segs[i], ctrl = new AbortController();
+        sess.inflight = { i, ctrl };
+        let data;
+        try {
+          const raw = await fetchBuf(`${WORKER}/r/${relTag(sess.id, seg.p || 0)}/${seg.name}`, ctrl.signal);
+          data = await decryptChunk(sess.key, seg.name, raw);
+        } catch (e) {
+          if (e.name === 'AbortError') { sess.again = true; break; }
+          throw e;
+        } finally { sess.inflight = null; }
+        if (sess.dead) return;
+        const [nlo, nhi] = windowFor(idxAt(video.currentTime));
+        if (i < nlo || i > nhi) { sess.again = true; break; }       // user moved on while downloading
+        await appendSeg(sess, i, data);
+        sess.have.add(i);
+        const n = sess.segs.length;
+        if (sess.have.has(n - 1) && sess.ms.readyState === 'open') {
+          try { await sbOp(sess, () => { if (sess.ms.readyState === 'open') sess.ms.endOfStream(); }); } catch {}
+        }
+      }
+    } while (sess.again && !sess.dead);
+  } catch (e) {
+    if (!sess.dead) showError(e.message || 'Playback error');
+  } finally { sess.pumping = false; }
+}
+
+// Called whenever the playhead moves: abort downloads that are no longer near it.
+function onMove() {
+  if (!S || !S.sb) return;
+  const [lo, hi] = windowFor(idxAt(video.currentTime));
+  if (S.inflight && (S.inflight.i < lo || S.inflight.i > hi)) S.inflight.ctrl.abort();
+  pump();
+}
+video.addEventListener('seeking', onMove);
+video.addEventListener('timeupdate', onMove);
+video.addEventListener('waiting', onMove);
+
+/* ====== keyboard (the native controls already handle space and arrows when the video has focus) ====== */
+function seekBy(d) {
+  if (!S || !S.man) return;
+  video.currentTime = Math.min(Math.max(0, video.currentTime + d), S.man.duration - 0.1);
+}
+document.addEventListener('keydown', (e) => {
+  if (!S || !S.man || e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key.toLowerCase(), native = document.activeElement === video;
+  if (k === 'k' || (!native && k === ' ')) { e.preventDefault(); video.paused ? video.play().catch(() => {}) : video.pause(); }
+  else if (!native && e.key === 'ArrowLeft') { e.preventDefault(); seekBy(-5); }
+  else if (!native && e.key === 'ArrowRight') { e.preventDefault(); seekBy(5); }
+  else if (k === 'j') seekBy(-30);
+  else if (k === 'l') seekBy(30);
+  else if (k === 'm') video.muted = !video.muted;
+  else if (k === 'f') { document.fullscreenElement ? document.exitFullscreen() : video.requestFullscreen && video.requestFullscreen().catch(() => {}); }
+});
+
+/* ====== start ====== */
+async function main() {
+  const { id, path, t } = readLink();
+  if (!id && !path) { showError('No video in this link.'); return; }
+  showLoading('');
+  try {
+    let vid = id;
+    if (path) {
+      const node = await findByPath(path);
+      vid = node.id;
+      document.title = node.name;
+    }
+    await openVideo(vid, t);
+  } catch (e) { showError(e.message || 'Something went wrong.'); }
+}
+window.addEventListener('hashchange', () => location.reload());
+main();
+</script>
+</body>
+</html>
