@@ -134,6 +134,7 @@ const notFound = (msg) => Object.assign(new Error(msg), { notFound: true });
 const hashSecret = () => location.hash.replace(/^#\/?/, '');
 function route() {
   const secret = hashSecret();
+  hold = null;
   if (!SECRET_RE.test(secret)) { showGone(); return; }
   showVideo();
   openVideo(secret);
@@ -142,6 +143,7 @@ window.addEventListener('hashchange', route);
 
 /* ====== player ====== */
 let S = null;
+let hold = null;   // {t, d, until}: position/duration shown while the player is being rebuilt
 
 function stopPlayback() {
   if (!S) return;
@@ -177,9 +179,12 @@ async function fetchRetry(url, signal, tries = 3) {
 // Tear the player down and rebuild it at the same spot (used for decoder / MediaSource failures).
 function recover(opts = {}) {
   if (!S || S.dead) return;
-  if (S.retries >= 5) { setStatus('Playback failed. Reload the page.', true); return; }
+  if (S.retries >= 5) { hold = null; setStatus('Playback failed. Reload the page.', true); return; }
   const secret = S.secret, retries = S.retries + 1, rate = video.playbackRate;
-  const t = opts.t !== undefined ? opts.t : Math.max(0, video.currentTime - 1);
+  // resume where the viewer clicked if a seek was in flight, otherwise just before the current position
+  const t = opts.t !== undefined ? opts.t : (pending !== null ? pending : Math.max(0, video.currentTime - 1));
+  hold = { t, d: dur(), until: Date.now() + 20000 };   // keep the progress bar parked here during the rebuild
+  pending = null;
   const play = opts.play !== undefined ? opts.play : !video.paused;
   console.warn('Recovering player', retries, 'at', t);
   setStatus(opts.quiet ? '' : `Reconnecting... (${retries}/5)`);
@@ -402,7 +407,7 @@ const IC = {
 };
 const wrap = $('#wrap'), bar = $('#bar'), tip = $('#tip'), SPEEDS = [0.75, 1, 1.25, 1.5, 2];
 let pending = null, drag = false, idleT;
-const dur = () => (S && S.man ? S.man.duration : 0);
+const dur = () => (S && S.man ? S.man.duration : hold ? hold.d : 0);
 const fmt = (s) => { s = Math.max(0, Math.floor(s || 0)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = String(s % 60).padStart(2, '0'); return h ? `${h}:${String(m).padStart(2, '0')}:${x}` : `${m}:${x}`; };
 const toggle = () => (video.paused ? video.play().catch(() => {}) : video.pause());
 const goFs = () => (document.fullscreenElement ? document.exitFullscreen() : wrap.requestFullscreen?.());
@@ -414,7 +419,8 @@ function busy() {   // spinner while opening, seeking, or starved for data
   loader.classList.toggle('on', !!(opening || starved));
 }
 function paint() {
-  const d = dur(), t = pending !== null ? pending : video.currentTime;
+  if (hold && (Date.now() > hold.until || (S && S.ready && video.readyState >= 2))) hold = null;
+  const d = dur(), t = pending !== null ? pending : hold ? hold.t : video.currentTime;
   const pct = d ? Math.min(100, t / d * 100) : 0;
   $('#pl').style.width = pct + '%'; $('#knob').style.left = pct + '%';
   let be = 0; const b = video.buffered;
