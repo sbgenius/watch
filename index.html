@@ -231,14 +231,14 @@ async function fetchBuf(url, signal) {
   return r.arrayBuffer();
 }
 
-async function openVideo(secret) {
+async function openVideo(secret, resumeAt = null, retries = 0) {
   if (S && S.secret === secret) return;
   stopPlayback();
   $('#pTitle').textContent = 'Opening...';
   $('#pSub').textContent = '';
   $('#strip').innerHTML = '';
   setStatus('Opening...');
-  const sess = { secret, dead: false, have: new Set(), inflight: null, pumping: false, again: false };
+  const sess = { secret, retries, startedAt: 0, dead: false, have: new Set(), inflight: null, pumping: false, again: false };
   S = sess;
   try {
     const { tag, key } = await deriveFromSecret(secret);
@@ -270,13 +270,20 @@ async function openVideo(secret) {
     if (sess.dead) return;
     await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.appendBuffer(initBuf)));
 
-    let saved = 0; try { saved = parseFloat(localStorage.getItem('pos:' + tag) || '0'); } catch {}
-    if (saved > 5 && saved < man.duration - 5) video.currentTime = saved;
+    let start = resumeAt;                      // set when recovering from a playback error
+    if (start === null) {
+      start = 0; try { start = parseFloat(localStorage.getItem('pos:' + tag) || '0') || 0; } catch {}
+      if (!(start > 5 && start < man.duration - 5)) start = 0;
+    }
+    if (start > 0) video.currentTime = start;
+    sess.startedAt = start;
     video.playbackRate = parseFloat($('#speed').value);
     sess.saver = setInterval(() => {
       try { if (!video.paused) localStorage.setItem('pos:' + tag, String(video.currentTime)); } catch {}
+      if (sess.retries && !video.paused && video.currentTime > sess.startedAt + 20) sess.retries = 0;   // stable again
     }, 5000);
     pump();
+    if (resumeAt !== null) video.play().catch(() => {});
   } catch (e) {
     if (!sess.dead) setStatus(e.message, true);
   }
@@ -377,6 +384,20 @@ function onMove() {
 video.addEventListener('seeking', onMove);
 video.addEventListener('timeupdate', onMove);
 video.addEventListener('waiting', onMove);
+
+// Chrome sometimes drops the decoder mid-video ("file is corrupt") even though the data is fine.
+// Rebuild the player at the same position instead of leaving the viewer stuck.
+video.addEventListener('error', () => {
+  if (!S || S.dead || !S.sb) return;
+  const e = video.error;
+  const detail = e ? `code ${e.code}${e.message ? ': ' + e.message : ''}` : 'unknown';
+  console.error('Video error', detail, 'at', video.currentTime);
+  if (S.retries >= 3) { setStatus(`Playback failed (${detail}). Reload the page.`, true); return; }
+  const secret = S.secret, retries = S.retries + 1, t = Math.max(0, video.currentTime - 1);
+  setStatus(`Playback hiccup (${detail}). Recovering ${retries}/3...`, true);
+  stopPlayback();
+  openVideo(secret, t, retries);
+});
 
 /* ====== player controls ====== */
 function seekTo(t) {
