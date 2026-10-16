@@ -19,6 +19,15 @@ video{position:fixed;inset:0;width:100%;height:100dvh;background:#000;object-fit
 .gone .ghost{animation:float 3s ease-in-out infinite}
 .gone h1{font-size:1.5rem;font-weight:800;letter-spacing:-.02em}
 .gone p{font-size:.95rem;color:#a7a7b5;max-width:28rem;line-height:1.5}
+.load{position:fixed;left:50%;top:50%;width:76px;height:76px;margin:-38px 0 0 -38px;pointer-events:none;z-index:4;opacity:0;transition:opacity .3s;filter:drop-shadow(0 0 14px rgba(255,61,84,.55))}
+.load.on{opacity:1}
+.load i{position:absolute;display:block}
+.load .r1,.load .r2{border-radius:50%;-webkit-mask:radial-gradient(farthest-side,transparent calc(100% - 3px),#000 calc(100% - 2px));mask:radial-gradient(farthest-side,transparent calc(100% - 3px),#000 calc(100% - 2px))}
+.load .r1{inset:0;background:conic-gradient(from 0deg,transparent 30%,#ff3d54);animation:ld-spin 1s linear infinite}
+.load .r2{inset:11px;background:conic-gradient(from 0deg,transparent 30%,#fff);animation:ld-spin 1.5s linear infinite reverse}
+.load .core{inset:29px;background:linear-gradient(135deg,#ff3d54,#ff9fb2);animation:ld-morph 1.6s ease-in-out infinite}
+@keyframes ld-spin{to{transform:rotate(360deg)}}
+@keyframes ld-morph{0%,100%{border-radius:50%;transform:rotate(0) scale(1)}50%{border-radius:22%;transform:rotate(180deg) scale(.8)}}
 .wrap{position:fixed;inset:0;background:#000;user-select:none;-webkit-user-select:none}
 .wrap.idle{cursor:none}
 .ctl{position:fixed;left:0;right:0;bottom:0;padding:2.5rem 1rem .6rem;background:linear-gradient(transparent,rgba(0,0,0,.78));transition:opacity .25s;z-index:5}
@@ -49,6 +58,7 @@ video{position:fixed;inset:0;width:100%;height:100dvh;background:#000;object-fit
 <div class="wrap" id="wrap">
   <video id="video" playsinline></video>
   <div class="note" id="note" role="status"></div>
+  <div class="load" id="load" aria-hidden="true"><i class="r1"></i><i class="r2"></i><i class="core"></i></div>
   <div class="ctl" id="ctl">
     <div class="bar" id="bar"><i id="buf"></i><i id="pl"></i><div class="knob" id="knob"></div><div class="tip" id="tip"></div></div>
     <div class="row">
@@ -205,6 +215,7 @@ async function openVideo(secret, resumeAt = null, retries = 0, rate = 1) {
       if (sess.retries && !video.paused && video.currentTime > sess.startedAt + 20) sess.retries = 0;   // stable again
     }, 5000);
     setStatus('');
+    sess.ready = true;
     pump();
     if (resumeAt !== null) video.play().catch(() => {});
   } catch (e) {
@@ -365,6 +376,12 @@ const fmt = (s) => { s = Math.max(0, Math.floor(s || 0)); const h = Math.floor(s
 const toggle = () => (video.paused ? video.play().catch(() => {}) : video.pause());
 const goFs = () => (document.fullscreenElement ? document.exitFullscreen() : wrap.requestFullscreen?.());
 
+const loader = $('#load');
+function busy() {   // spinner while opening, seeking, or starved for data
+  const opening = S && !S.ready && !$('#note').classList.contains('bad');
+  const starved = S && S.ready && !video.ended && video.readyState < 3 && (!video.paused || video.seeking || pending !== null);
+  loader.classList.toggle('on', !!(opening || starved));
+}
 function paint() {
   const d = dur(), t = pending !== null ? pending : video.currentTime;
   const pct = d ? Math.min(100, t / d * 100) : 0;
@@ -373,6 +390,7 @@ function paint() {
   for (let i = 0; i < b.length; i++) if (b.start(i) <= t + 0.5 && b.end(i) >= t) be = b.end(i);
   $('#buf').style.width = (d ? Math.min(100, be / d * 100) : 0) + '%';
   $('#time').textContent = fmt(t) + ' / ' + fmt(d);
+  busy();
 }
 function icons() {
   $('#bPlay').innerHTML = video.paused ? IC.play : IC.pause;
@@ -404,7 +422,7 @@ video.addEventListener('click', toggle);
 video.addEventListener('dblclick', () => { toggle(); goFs(); });
 
 ['play', 'pause', 'volumechange', 'ratechange'].forEach((ev) => video.addEventListener(ev, icons));
-['timeupdate', 'progress', 'seeking', 'durationchange', 'loadedmetadata'].forEach((ev) => video.addEventListener(ev, paint));
+['timeupdate', 'progress', 'seeking', 'durationchange', 'loadedmetadata', 'waiting', 'playing', 'canplay', 'stalled'].forEach((ev) => video.addEventListener(ev, paint));
 video.addEventListener('seeked', () => { pending = null; paint(); });
 video.addEventListener('pause', poke);
 ['mousemove', 'pointerdown', 'touchstart'].forEach((ev) => wrap.addEventListener(ev, poke, { passive: true }));
