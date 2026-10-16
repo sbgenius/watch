@@ -277,13 +277,23 @@ function isBuf(sess, i) {
 }
 function windowFor(cur) { return [Math.max(0, cur - BEHIND), Math.min(S.segs.length - 1, cur + AHEAD)]; }
 
+// Drop everything outside the window in two big range removals, with a safety margin on the inner edge.
+// (Per-segment removal using manifest times clipped the tail of the NEXT kept segment whenever the manifest
+// was off by even a frame or two, which leaves a tiny gap and stalls/crashes the decoder.)
 async function evict(sess, lo, hi) {
-  for (const i of [...sess.have]) {
-    if (i >= lo && i <= hi) continue;
-    const s = sess.segs[i];
-    try { await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.remove(s.start, s.start + s.dur - 0.01))); } catch {}
-    sess.have.delete(i);
+  const M = 0.5, segs = sess.segs, end = sess.man.duration + 10;
+  if (![...sess.have].some((i) => i < lo || i > hi)) return;
+  const ranges = [];
+  const before = segs[lo].start - M;
+  if (before > 0.1) ranges.push([0, before]);
+  if (hi + 1 < segs.length) {
+    const from = segs[hi + 1].start + M;
+    if (from < sess.man.duration) ranges.push([from, end]);
   }
+  for (const [x, y] of ranges) {
+    try { await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.remove(x, y))); } catch {}
+  }
+  for (const i of [...sess.have]) if (i < lo || i > hi) sess.have.delete(i);
 }
 
 async function appendSeg(sess, i, data) {
