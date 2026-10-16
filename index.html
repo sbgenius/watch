@@ -12,21 +12,55 @@
 html,body{height:100%;background:#000;color:#f2f2f5;font-family:var(--font);overflow:hidden;-webkit-font-smoothing:antialiased}
 .hidden{display:none!important}
 video{position:fixed;inset:0;width:100%;height:100dvh;background:#000;object-fit:contain;outline:none}
-.note{position:fixed;left:0;right:0;bottom:4.5rem;text-align:center;padding:0 1rem;font-size:.85rem;color:#a7a7b5;pointer-events:none;text-shadow:0 1px 6px #000}
+.note{position:fixed;left:0;right:0;bottom:7rem;text-align:center;padding:0 1rem;font-size:.85rem;color:#a7a7b5;pointer-events:none;text-shadow:0 1px 6px #000}
 .note.bad{color:#ff5c6c}
 .gone{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.7rem;text-align:center;padding:1.5rem;background:#0a0a0d}
 .gone svg{width:112px;height:auto;margin-bottom:.4rem;overflow:visible}
 .gone .ghost{animation:float 3s ease-in-out infinite}
 .gone h1{font-size:1.5rem;font-weight:800;letter-spacing:-.02em}
 .gone p{font-size:.95rem;color:#a7a7b5;max-width:28rem;line-height:1.5}
+.wrap{position:fixed;inset:0;background:#000;user-select:none;-webkit-user-select:none}
+.wrap.idle{cursor:none}
+.ctl{position:fixed;left:0;right:0;bottom:0;padding:2.5rem 1rem .6rem;background:linear-gradient(transparent,rgba(0,0,0,.78));transition:opacity .25s;z-index:5}
+.wrap.idle .ctl{opacity:0;pointer-events:none}
+.bar{position:relative;height:16px;cursor:pointer;touch-action:none;display:flex;align-items:center}
+.bar::before{content:"";position:absolute;left:0;right:0;height:4px;background:rgba(255,255,255,.25);border-radius:2px;transition:height .1s}
+.bar i{position:absolute;left:0;height:4px;border-radius:2px;pointer-events:none;transition:height .1s}
+.bar:hover::before,.bar:hover i,.bar.drag::before,.bar.drag i{height:6px}
+#buf{background:rgba(255,255,255,.4)}#pl{background:#ff3d54}
+.knob{position:absolute;width:13px;height:13px;border-radius:50%;background:#ff3d54;transform:translateX(-50%) scale(0);transition:transform .1s;pointer-events:none}
+.bar:hover .knob,.bar.drag .knob{transform:translateX(-50%) scale(1)}
+.tip{position:absolute;bottom:22px;transform:translateX(-50%);background:rgba(0,0,0,.85);padding:.2rem .5rem;border-radius:4px;font-size:.75rem;display:none;pointer-events:none}
+.bar:hover .tip,.bar.drag .tip{display:block}
+.row{display:flex;align-items:center;gap:.3rem;margin-top:.3rem}
+.row button{background:none;border:0;color:#fff;min-width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer}
+.row button:hover{background:rgba(255,255,255,.15)}
+.row svg{width:24px;height:24px;fill:currentColor}
+#bSpeed{padding:0 .7rem;border-radius:4px;font-size:.85rem;font-weight:600}
+#vol{width:70px;accent-color:#fff}
+#time{font-size:.82rem;font-variant-numeric:tabular-nums;margin-left:.5rem}
+.sp{flex:1}
 @keyframes float{50%{transform:translateY(-9px)}}
 @media (prefers-reduced-motion:reduce){*{animation:none!important}}
 </style>
 </head>
 <body>
 
-<video id="video" controls playsinline></video>
-<div class="note" id="note" role="status"></div>
+<div class="wrap" id="wrap">
+  <video id="video" playsinline></video>
+  <div class="note" id="note" role="status"></div>
+  <div class="ctl" id="ctl">
+    <div class="bar" id="bar"><i id="buf"></i><i id="pl"></i><div class="knob" id="knob"></div><div class="tip" id="tip"></div></div>
+    <div class="row">
+      <button id="bPlay" aria-label="Play or pause"></button>
+      <button id="bMute" aria-label="Mute"></button>
+      <input id="vol" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume">
+      <span id="time">0:00 / 0:00</span><span class="sp"></span>
+      <button id="bSpeed" aria-label="Speed">1x</button>
+      <button id="bFs" aria-label="Fullscreen"></button>
+    </div>
+  </div>
+</div>
 
 <div class="gone hidden" id="gone">
   <svg viewBox="0 0 120 134" aria-hidden="true">
@@ -48,7 +82,7 @@ video{position:fixed;inset:0;width:100%;height:100dvh;background:#000;object-fit
 'use strict';
 /* ====== config (keep in sync with main.py / worker) ====== */
 const WORKER = 'https://streamer.shreyasgokhale200.workers.dev';
-const AHEAD = 4, BEHIND = 2;
+const AHEAD = 6, BEHIND = 3;
 const SECRET_RE = /^[A-Za-z0-9_-]{43}$/;
 
 const $ = (s) => document.querySelector(s);
@@ -82,13 +116,13 @@ function setStatus(t, bad) {
 function showGone() {
   stopPlayback();
   setStatus('');
-  video.classList.add('hidden');
+  $('#wrap').classList.add('hidden');
   $('#gone').classList.remove('hidden');
   document.title = 'Not found';
 }
 function showVideo() {
   $('#gone').classList.add('hidden');
-  video.classList.remove('hidden');
+  $('#wrap').classList.remove('hidden');
 }
 const notFound = (msg) => Object.assign(new Error(msg), { notFound: true });
 
@@ -230,7 +264,8 @@ async function pump() {
     do {
       sess.again = false;
       const cur = idxAt(video.currentTime), [lo, hi] = windowFor(cur);
-      await evict(sess, lo, hi);
+      let skipped = !sess.have.has(cur);          // mid-seek: keep old data until the target is in
+      if (!skipped) await evict(sess, lo, hi);
       const order = [cur];
       for (let i = cur + 1; i <= hi; i++) order.push(i);
       for (let i = cur - 1; i >= lo; i--) order.push(i);
@@ -252,6 +287,7 @@ async function pump() {
         if (i < nlo || i > nhi) { sess.again = true; break; }       // user moved on while downloading
         await appendSeg(sess, i, data);
         sess.have.add(i);
+        if (skipped && i === cur) { skipped = false; await evict(sess, lo, hi); }
         const n = sess.segs.length;
         if (sess.have.has(n - 1) && sess.ms.readyState === 'open') {
           try { await sbOp(sess, () => { if (sess.ms.readyState === 'open') sess.ms.endOfStream(); }); } catch {}
@@ -291,18 +327,84 @@ video.addEventListener('error', () => {
 /* ====== keyboard shortcuts ====== */
 function seekTo(t) {
   if (!S || !S.man) return;
-  video.currentTime = Math.min(Math.max(0, t), S.man.duration - 0.1);
+  t = Math.min(Math.max(0, t), S.man.duration - 0.1);
+  pending = t; setTimeout(() => { if (pending === t) { pending = null; paint(); } }, 8000);
+  video.currentTime = t;
+  paint();
 }
 document.addEventListener('keydown', (e) => {
   if (!S || !S.man) return;
   const k = e.key.toLowerCase();
-  if (k === ' ' || k === 'k') { e.preventDefault(); video.paused ? video.play().catch(() => {}) : video.pause(); }
+  if (k === ' ' || k === 'k') { e.preventDefault(); toggle(); }
+  else if (k === 'm') video.muted = !video.muted;
   else if (e.key === 'ArrowLeft') { e.preventDefault(); seekTo(video.currentTime - 5); }
   else if (e.key === 'ArrowRight') { e.preventDefault(); seekTo(video.currentTime + 5); }
   else if (k === 'j') seekTo(video.currentTime - 30);
   else if (k === 'l') seekTo(video.currentTime + 30);
   else if (k === 'f') { document.fullscreenElement ? document.exitFullscreen() : video.requestFullscreen?.(); }
 });
+
+/* ====== custom controls ====== */
+const IC = {
+  play: '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>',
+  pause: '<svg viewBox="0 0 24 24"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>',
+  vol: '<svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9zM16 8a5 5 0 010 8z"/></svg>',
+  mute: '<svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9z"/><path d="M15 9l6 6m0-6l-6 6" stroke="currentColor" stroke-width="2" fill="none"/></svg>',
+  fs: '<svg viewBox="0 0 24 24"><path d="M5 5h5v2H7v3H5zM14 5h5v5h-2V7h-3zM5 14h2v3h3v2H5zM17 14h2v5h-5v-2h3z"/></svg>',
+};
+const wrap = $('#wrap'), bar = $('#bar'), tip = $('#tip'), SPEEDS = [0.75, 1, 1.25, 1.5, 2];
+let pending = null, drag = false, idleT;
+const dur = () => (S && S.man ? S.man.duration : 0);
+const fmt = (s) => { s = Math.max(0, Math.floor(s || 0)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = String(s % 60).padStart(2, '0'); return h ? `${h}:${String(m).padStart(2, '0')}:${x}` : `${m}:${x}`; };
+const toggle = () => (video.paused ? video.play().catch(() => {}) : video.pause());
+const goFs = () => (document.fullscreenElement ? document.exitFullscreen() : wrap.requestFullscreen?.());
+
+function paint() {
+  const d = dur(), t = pending !== null ? pending : video.currentTime;
+  const pct = d ? Math.min(100, t / d * 100) : 0;
+  $('#pl').style.width = pct + '%'; $('#knob').style.left = pct + '%';
+  let be = 0; const b = video.buffered;
+  for (let i = 0; i < b.length; i++) if (b.start(i) <= t + 0.5 && b.end(i) >= t) be = b.end(i);
+  $('#buf').style.width = (d ? Math.min(100, be / d * 100) : 0) + '%';
+  $('#time').textContent = fmt(t) + ' / ' + fmt(d);
+}
+function icons() {
+  $('#bPlay').innerHTML = video.paused ? IC.play : IC.pause;
+  $('#bMute').innerHTML = video.muted || video.volume === 0 ? IC.mute : IC.vol;
+  $('#bSpeed').textContent = video.playbackRate + 'x';
+}
+function poke() {
+  wrap.classList.remove('idle'); clearTimeout(idleT);
+  idleT = setTimeout(() => { if (!video.paused && !drag) wrap.classList.add('idle'); }, 2500);
+}
+
+const barT = (e) => { const r = bar.getBoundingClientRect(); return Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)) * dur(); };
+bar.addEventListener('pointerdown', (e) => { if (!dur()) return; drag = true; bar.classList.add('drag'); bar.setPointerCapture(e.pointerId); pending = barT(e); paint(); });
+bar.addEventListener('pointermove', (e) => {
+  if (!dur()) return;
+  const t = barT(e), r = bar.getBoundingClientRect();
+  tip.textContent = fmt(t); tip.style.left = (e.clientX - r.left) + 'px';
+  if (drag) { pending = t; paint(); }
+});
+bar.addEventListener('pointerup', (e) => { if (!drag) return; drag = false; bar.classList.remove('drag'); seekTo(barT(e)); });
+bar.addEventListener('pointercancel', () => { drag = false; pending = null; bar.classList.remove('drag'); });
+
+$('#bPlay').onclick = toggle;
+$('#bMute').onclick = () => { video.muted = !video.muted; };
+$('#vol').oninput = (e) => { video.volume = +e.target.value; video.muted = false; };
+$('#bSpeed').onclick = () => { video.playbackRate = SPEEDS[(SPEEDS.indexOf(video.playbackRate) + 1) % SPEEDS.length]; };
+$('#bFs').innerHTML = IC.fs; $('#bFs').onclick = goFs;
+video.addEventListener('click', toggle);
+video.addEventListener('dblclick', () => { toggle(); goFs(); });
+
+['play', 'pause', 'volumechange', 'ratechange'].forEach((ev) => video.addEventListener(ev, icons));
+['timeupdate', 'progress', 'seeking', 'durationchange', 'loadedmetadata'].forEach((ev) => video.addEventListener(ev, paint));
+video.addEventListener('seeked', () => { pending = null; paint(); });
+video.addEventListener('pause', poke);
+['mousemove', 'pointerdown', 'touchstart'].forEach((ev) => wrap.addEventListener(ev, poke, { passive: true }));
+document.addEventListener('keydown', poke);
+setInterval(paint, 250);
+icons(); paint(); poke();
 
 route();
 </script>
