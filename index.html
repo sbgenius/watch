@@ -135,7 +135,7 @@ const notFound = (msg) => Object.assign(new Error(msg), { notFound: true });
 const hashSecret = () => location.hash.replace(/^#\/?/, '');
 function route() {
   const secret = hashSecret();
-  hold = null;
+  hold = null; lastFail = null;
   if (!SECRET_RE.test(secret)) { showGone(); return; }
   showVideo();
   openVideo(secret);
@@ -144,6 +144,7 @@ window.addEventListener('hashchange', route);
 
 /* ====== player ====== */
 let S = null;
+let lastFail = null;   // media time of the previous decoder failure
 let hold = null;   // {t, d, until}: position/duration shown while the player is being rebuilt
 
 function stopPlayback() {
@@ -183,7 +184,15 @@ function recover(opts = {}) {
   if (S.retries >= 5) { hold = null; setStatus('Playback failed. Reload the page.', true); return; }
   const secret = S.secret, retries = S.retries + 1, rate = video.playbackRate;
   // resume where the viewer clicked if a seek was in flight, otherwise just before the current position
-  const t = opts.t !== undefined ? opts.t : (pending !== null ? pending : Math.max(0, video.currentTime - 1));
+  let t = opts.t !== undefined ? opts.t : (pending !== null ? pending : Math.max(0, video.currentTime - 1));
+  const failT = video.currentTime;
+  if (opts.t === undefined && lastFail !== null && Math.abs(failT - lastFail) < 4 && S.segs) {
+    // Same spot failed again: a fresh decoder can't get past it, so hop to the next segment's keyframe.
+    const k = Math.min(S.segs.length - 1, idxAt(failT) + 1);
+    t = S.segs[k].start + 0.05;
+    console.warn('Same spot failed twice, skipping ahead to', t);
+  }
+  lastFail = failT;
   hold = { t, d: dur(), until: Date.now() + 20000 };   // keep the progress bar parked here during the rebuild
   pending = null;
   const play = opts.play !== undefined ? opts.play : !video.paused;
