@@ -234,6 +234,12 @@ function idxAt(t) {
   while (lo < hi) { const m = (lo + hi + 1) >> 1; if (segs[m].start <= t) lo = m; else hi = m - 1; }
   return lo;
 }
+// Ask the browser what is really buffered (it may evict on its own), not our own bookkeeping.
+function isBuf(sess, i) {
+  const g = sess.segs[i], m = g.start + g.dur / 2, b = sess.sb.buffered;
+  for (let k = 0; k < b.length; k++) if (b.start(k) <= m && b.end(k) >= m) return true;
+  return false;
+}
 function windowFor(cur) { return [Math.max(0, cur - BEHIND), Math.min(S.segs.length - 1, cur + AHEAD)]; }
 
 async function evict(sess, lo, hi) {
@@ -264,14 +270,14 @@ async function pump() {
     do {
       sess.again = false;
       const cur = idxAt(video.currentTime), [lo, hi] = windowFor(cur);
-      let skipped = !sess.have.has(cur);          // mid-seek: keep old data until the target is in
-      if (!skipped) await evict(sess, lo, hi);
+      let skipped = !isBuf(sess, cur);            // mid-seek: keep old data until the target is in
+      if (!skipped && sess.have.size > 30) await evict(sess, lo, hi);   // remove rarely, in one batch
       const order = [cur];
       for (let i = cur + 1; i <= hi; i++) order.push(i);
       for (let i = cur - 1; i >= lo; i--) order.push(i);
       for (const i of order) {
         if (sess.dead || sess.again) break;
-        if (sess.have.has(i)) continue;
+        if (isBuf(sess, i)) continue;
         const seg = sess.segs[i], ctrl = new AbortController();
         sess.inflight = { i, ctrl };
         let data;
@@ -287,9 +293,9 @@ async function pump() {
         if (i < nlo || i > nhi) { sess.again = true; break; }       // user moved on while downloading
         await appendSeg(sess, i, data);
         sess.have.add(i);
-        if (skipped && i === cur) { skipped = false; await evict(sess, lo, hi); }
+        if (skipped && i === cur) { skipped = false; if (sess.have.size > 30) await evict(sess, lo, hi); }
         const n = sess.segs.length;
-        if (sess.have.has(n - 1) && sess.ms.readyState === 'open') {
+        if (isBuf(sess, n - 1) && sess.ms.readyState === 'open') {
           try { await sbOp(sess, () => { if (sess.ms.readyState === 'open') sess.ms.endOfStream(); }); } catch {}
         }
       }
