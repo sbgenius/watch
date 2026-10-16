@@ -19,15 +19,9 @@ video{position:fixed;inset:0;width:100%;height:100dvh;background:#000;object-fit
 .gone .ghost{animation:float 3s ease-in-out infinite}
 .gone h1{font-size:1.5rem;font-weight:800;letter-spacing:-.02em}
 .gone p{font-size:.95rem;color:#a7a7b5;max-width:28rem;line-height:1.5}
-.load{position:fixed;left:50%;top:50%;width:76px;height:76px;margin:-38px 0 0 -38px;pointer-events:none;z-index:4;opacity:0;transition:opacity .3s;filter:drop-shadow(0 0 14px rgba(255,61,84,.55))}
+.load{position:fixed;left:50%;top:50%;width:48px;height:48px;margin:-24px 0 0 -24px;border:4px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;pointer-events:none;z-index:4;opacity:0;transition:opacity .3s;animation:ld-spin .9s linear infinite}
 .load.on{opacity:1}
-.load i{position:absolute;display:block}
-.load .r1,.load .r2{border-radius:50%;-webkit-mask:radial-gradient(farthest-side,transparent calc(100% - 3px),#000 calc(100% - 2px));mask:radial-gradient(farthest-side,transparent calc(100% - 3px),#000 calc(100% - 2px))}
-.load .r1{inset:0;background:conic-gradient(from 0deg,transparent 30%,#ff3d54);animation:ld-spin 1s linear infinite}
-.load .r2{inset:11px;background:conic-gradient(from 0deg,transparent 30%,#fff);animation:ld-spin 1.5s linear infinite reverse}
-.load .core{inset:29px;background:linear-gradient(135deg,#ff3d54,#ff9fb2);animation:ld-morph 1.6s ease-in-out infinite}
 @keyframes ld-spin{to{transform:rotate(360deg)}}
-@keyframes ld-morph{0%,100%{border-radius:50%;transform:rotate(0) scale(1)}50%{border-radius:22%;transform:rotate(180deg) scale(.8)}}
 .wrap{position:fixed;inset:0;background:#000;user-select:none;-webkit-user-select:none}
 .wrap.idle{cursor:none}
 .ctl{position:fixed;left:0;right:0;bottom:0;padding:2.5rem 1rem .6rem;background:linear-gradient(transparent,rgba(0,0,0,.78));transition:opacity .25s;z-index:5}
@@ -50,7 +44,7 @@ video{position:fixed;inset:0;width:100%;height:100dvh;background:#000;object-fit
 #time{font-size:.82rem;font-variant-numeric:tabular-nums;margin-left:.5rem}
 .sp{flex:1}
 @keyframes float{50%{transform:translateY(-9px)}}
-@media (prefers-reduced-motion:reduce){*{animation:none!important}}
+@media (prefers-reduced-motion:reduce){*:not(.load){animation:none!important}.load{animation-duration:2.5s}}
 </style>
 </head>
 <body>
@@ -58,7 +52,7 @@ video{position:fixed;inset:0;width:100%;height:100dvh;background:#000;object-fit
 <div class="wrap" id="wrap">
   <video id="video" playsinline></video>
   <div class="note" id="note" role="status"></div>
-  <div class="load" id="load" aria-hidden="true"><i class="r1"></i><i class="r2"></i><i class="core"></i></div>
+  <div class="load" id="load" aria-hidden="true"></div>
   <div class="ctl" id="ctl">
     <div class="bar" id="bar"><i id="buf"></i><i id="pl"></i><div class="knob" id="knob"></div><div class="tip" id="tip"></div></div>
     <div class="row">
@@ -170,7 +164,31 @@ async function fetchBuf(url, signal) {
   return r.arrayBuffer();
 }
 
-async function openVideo(secret, resumeAt = null, retries = 0, rate = 1) {
+async function fetchRetry(url, signal, tries = 3) {
+  for (let n = 1; ; n++) {
+    try { return await fetchBuf(url, signal); }
+    catch (e) {
+      if (e.notFound || e.name === 'AbortError' || n >= tries) throw e;
+      await new Promise((r) => setTimeout(r, 400 * n));
+    }
+  }
+}
+
+// Tear the player down and rebuild it at the same spot (used for decoder / MediaSource failures).
+function recover(opts = {}) {
+  if (!S || S.dead) return;
+  if (S.retries >= 5) { setStatus('Playback failed. Reload the page.', true); return; }
+  const secret = S.secret, retries = S.retries + 1, rate = video.playbackRate;
+  const t = opts.t !== undefined ? opts.t : Math.max(0, video.currentTime - 1);
+  const play = opts.play !== undefined ? opts.play : !video.paused;
+  console.warn('Recovering player', retries, 'at', t);
+  setStatus(opts.quiet ? '' : `Reconnecting... (${retries}/5)`);
+  stopPlayback();
+  // give the browser a moment to fully detach the old MediaSource before building a new one
+  setTimeout(() => { if (!S && hashSecret() === secret) openVideo(secret, t, retries, rate, play); }, 150 * retries);
+}
+
+async function openVideo(secret, resumeAt = null, retries = 0, rate = 1, play = true) {
   if (S && S.secret === secret) return;
   stopPlayback();
   document.title = 'Video';
@@ -180,7 +198,7 @@ async function openVideo(secret, resumeAt = null, retries = 0, rate = 1) {
   try {
     const { tag, key } = await deriveFromSecret(secret);
     sess.tag = tag; sess.key = key;
-    const buf = await fetchBuf(`${WORKER}/r/${tag}/manifest.bin`);
+    const buf = await fetchRetry(`${WORKER}/r/${tag}/manifest.bin`);
     let man;
     try { man = JSON.parse(dec.decode(await decryptChunk(key, 'manifest.bin', buf))); }
     catch { throw notFound('Could not decrypt'); }
@@ -198,7 +216,7 @@ async function openVideo(secret, resumeAt = null, retries = 0, rate = 1) {
     sess.sb.mode = 'segments';
     sess.chain = Promise.resolve();
 
-    const initBuf = await decryptChunk(key, man.init, await fetchBuf(`${WORKER}/r/${relTag(tag, man.init_part || 0)}/${man.init}`));
+    const initBuf = await decryptChunk(key, man.init, await fetchRetry(`${WORKER}/r/${relTag(tag, man.init_part || 0)}/${man.init}`));
     if (sess.dead) return;
     await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.appendBuffer(initBuf)));
 
@@ -217,10 +235,11 @@ async function openVideo(secret, resumeAt = null, retries = 0, rate = 1) {
     setStatus('');
     sess.ready = true;
     pump();
-    if (resumeAt !== null) video.play().catch(() => {});
+    if (resumeAt !== null && play) video.play().catch(() => {});
   } catch (e) {
     if (sess.dead) return;
     if (e.notFound) showGone();
+    else if (e.name === 'InvalidStateError') recover({ t: resumeAt !== null ? resumeAt : 0, play });
     else setStatus(e.message, true);
   }
 }
@@ -257,7 +276,7 @@ async function evict(sess, lo, hi) {
   for (const i of [...sess.have]) {
     if (i >= lo && i <= hi) continue;
     const s = sess.segs[i];
-    try { await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.remove(s.start, s.start + s.dur))); } catch {}
+    try { await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.remove(s.start, s.start + s.dur - 0.01))); } catch {}
     sess.have.delete(i);
   }
 }
@@ -272,9 +291,21 @@ async function appendSeg(sess, i, data) {
   }
 }
 
+function allBufFrom(sess, from) {
+  for (let i = from; i < sess.segs.length; i++) if (!isBuf(sess, i)) return false;
+  return true;
+}
+// Only signal end-of-stream when everything from the playhead to the end is really buffered.
+async function maybeEnd(sess) {
+  if (sess.dead || sess.ms.readyState !== 'open') return;
+  if (!allBufFrom(sess, idxAt(video.currentTime))) return;
+  try { await sbOp(sess, () => { if (sess.ms.readyState === 'open') sess.ms.endOfStream(); }); } catch {}
+}
+
 async function pump() {
   const sess = S;
   if (!sess || !sess.sb) return;
+  if (sess.ms.readyState === 'closed') { recover(); return; }   // browser detached our MediaSource
   if (sess.pumping) { sess.again = true; return; }
   sess.pumping = true;
   try {
@@ -293,7 +324,7 @@ async function pump() {
         sess.inflight = { i, ctrl };
         let data;
         try {
-          const raw = await fetchBuf(`${WORKER}/r/${relTag(sess.tag, seg.p || 0)}/${seg.name}`, ctrl.signal);
+          const raw = await fetchRetry(`${WORKER}/r/${relTag(sess.tag, seg.p || 0)}/${seg.name}`, ctrl.signal);
           data = await decryptChunk(sess.key, seg.name, raw);
         } catch (e) {
           if (e.name === 'AbortError') { sess.again = true; break; }
@@ -305,14 +336,15 @@ async function pump() {
         await appendSeg(sess, i, data);
         sess.have.add(i);
         if (skipped && i === cur) { skipped = false; if (sess.have.size > 30) await evict(sess, lo, hi); }
-        const n = sess.segs.length;
-        if (isBuf(sess, n - 1) && sess.ms.readyState === 'open') {
-          try { await sbOp(sess, () => { if (sess.ms.readyState === 'open') sess.ms.endOfStream(); }); } catch {}
-        }
+        if (sess.failed) { sess.failed = false; setStatus(''); }
       }
+      if (!sess.dead && !sess.again) await maybeEnd(sess);
     } while (sess.again && !sess.dead);
   } catch (e) {
-    if (!sess.dead) setStatus(e.message || 'Playback error', true);
+    if (!sess.dead) {
+      if (e.name === 'InvalidStateError' || e.message === 'Video buffer error') recover();
+      else { sess.failed = true; setStatus(e.message || 'Playback error', true); }
+    }
   } finally { sess.pumping = false; }
 }
 
@@ -331,14 +363,13 @@ video.addEventListener('waiting', onMove);
 // Rebuild the player at the same position instead of leaving the viewer stuck.
 video.addEventListener('error', () => {
   if (!S || S.dead || !S.sb) return;
+  if (S.url && video.currentSrc && video.currentSrc !== S.url) return;   // stale error from an old session
   const e = video.error;
   const detail = e ? `code ${e.code}${e.message ? ': ' + e.message : ''}` : 'unknown';
   console.error('Video error', detail, 'at', video.currentTime);
-  if (S.retries >= 3) { setStatus(`Playback failed (${detail}). Reload the page.`, true); return; }
-  const secret = S.secret, retries = S.retries + 1, t = Math.max(0, video.currentTime - 1), rate = video.playbackRate;
-  setStatus(`Playback hiccup. Recovering ${retries}/3...`, true);
-  stopPlayback();
-  openVideo(secret, t, retries, rate);
+  const d = dur();
+  if (d && video.currentTime >= d - 2) recover({ t: 0, play: false, quiet: true });   // failed while draining at the very end
+  else recover();
 });
 
 /* ====== keyboard shortcuts ====== */
