@@ -87,6 +87,7 @@ video{position:fixed;inset:0;width:100%;height:100dvh;background:#000;object-fit
 /* ====== config (keep in sync with main.py / worker) ====== */
 const WORKER = 'https://streamer.shreyasgokhale200.workers.dev';
 const AHEAD = 6, BEHIND = 3;
+const BACK_KEEP = 90;   // seconds of already-watched video kept in the buffer
 const SECRET_RE = /^[A-Za-z0-9_-]{43}$/;
 
 const $ = (s) => document.querySelector(s);
@@ -277,32 +278,49 @@ function isBuf(sess, i) {
 }
 function windowFor(cur) { return [Math.max(0, cur - BEHIND), Math.min(S.segs.length - 1, cur + AHEAD)]; }
 
-// Drop everything outside the window in two big range removals, with a safety margin on the inner edge.
-// (Per-segment removal using manifest times clipped the tail of the NEXT kept segment whenever the manifest
-// was off by even a frame or two, which leaves a tiny gap and stalls/crashes the decoder.)
-async function evict(sess, lo, hi) {
-  const M = 0.5, segs = sess.segs, end = sess.man.duration + 10;
-  if (![...sess.have].some((i) => i < lo || i > hi)) return;
-  const ranges = [];
-  const before = segs[lo].start - M;
-  if (before > 0.1) ranges.push([0, before]);
-  if (hi + 1 < segs.length) {
-    const from = segs[hi + 1].start + M;
-    if (from < sess.man.duration) ranges.push([from, end]);
+function note(sess, msg) {   // tiny ring buffer of recent buffer operations, printed when the decoder fails
+  (sess.log || (sess.log = [])).push(`${(performance.now() / 1000).toFixed(1)}s ${msg}`);
+  if (sess.log.length > 12) sess.log.shift();
+}
+
+// Trim only data far BEHIND the playhead, in one range (what hls.js does). Data near or ahead of the
+// playhead is never removed by us any more; that is what seemed to upset Firefox's decoder.
+async function evict(sess, keepBack = BACK_KEEP) {
+  const cutoff = video.currentTime - keepBack;
+  if (cutoff < 1) return;
+  const i = idxAt(cutoff);                                   // keep whole segments from i on (keyframe intact)
+  if (![...sess.have].some((k) => k < i)) return;
+  const to = sess.segs[i].start - 0.5;
+  if (to > 0.1) {
+    note(sess, `remove 0-${to.toFixed(2)}`);
+    try { await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.remove(0, to))); } catch {}
   }
-  for (const [x, y] of ranges) {
-    try { await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.remove(x, y))); } catch {}
-  }
-  for (const i of [...sess.have]) if (i < lo || i > hi) sess.have.delete(i);
+  for (const k of [...sess.have]) if (k < i) sess.have.delete(k);
+}
+
+// Last resort when the browser says its buffer is full: drop far-ahead data.
+async function evictAhead(sess) {
+  const cur = idxAt(video.currentTime), from = Math.min(sess.segs.length - 1, cur + 3);
+  const x = sess.segs[from].start + 0.5;
+  if (x >= sess.man.duration) return;
+  note(sess, `remove ahead ${x.toFixed(2)}+`);
+  try { await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.remove(x, sess.man.duration + 10))); } catch {}
+  for (const k of [...sess.have]) if (k > from) sess.have.delete(k);
 }
 
 async function appendSeg(sess, i, data) {
-  try { await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.appendBuffer(data))); }
+  const put = () => sbOp(sess, () => sbWait(sess.sb, () => sess.sb.appendBuffer(data)));
+  note(sess, `append #${i}`);
+  try { await put(); }
   catch (e) {
     if (e.name !== 'QuotaExceededError') throw e;
-    const [lo, hi] = windowFor(idxAt(video.currentTime));
-    await evict(sess, Math.max(lo, i - 1), Math.min(hi, i + 1));   // tighten, then retry once
-    await sbOp(sess, () => sbWait(sess.sb, () => sess.sb.appendBuffer(data)));
+    await evict(sess, 10);                                   // browser buffer full: free the back side, retry
+    try { await put(); }
+    catch (e2) {
+      if (e2.name !== 'QuotaExceededError') throw e2;
+      await evictAhead(sess);
+      await put();
+    }
   }
 }
 
@@ -314,6 +332,7 @@ function allBufFrom(sess, from) {
 async function maybeEnd(sess) {
   if (sess.dead || sess.ms.readyState !== 'open') return;
   if (!allBufFrom(sess, idxAt(video.currentTime))) return;
+  note(sess, 'endOfStream');
   try { await sbOp(sess, () => { if (sess.ms.readyState === 'open') sess.ms.endOfStream(); }); } catch {}
 }
 
@@ -328,7 +347,7 @@ async function pump() {
       sess.again = false;
       const cur = idxAt(video.currentTime), [lo, hi] = windowFor(cur);
       let skipped = !isBuf(sess, cur);            // mid-seek: keep old data until the target is in
-      if (!skipped && sess.have.size > 30) await evict(sess, lo, hi);   // remove rarely, in one batch
+      if (!skipped && sess.have.size > 30) await evict(sess);   // remove rarely, in one batch
       const order = [cur];
       for (let i = cur + 1; i <= hi; i++) order.push(i);
       for (let i = cur - 1; i >= lo; i--) order.push(i);
@@ -350,7 +369,7 @@ async function pump() {
         if (i < nlo || i > nhi) { sess.again = true; break; }       // user moved on while downloading
         await appendSeg(sess, i, data);
         sess.have.add(i);
-        if (skipped && i === cur) { skipped = false; if (sess.have.size > 30) await evict(sess, lo, hi); }
+        if (skipped && i === cur) { skipped = false; if (sess.have.size > 30) await evict(sess); }
         if (sess.failed) { sess.failed = false; setStatus(''); }
       }
       if (!sess.dead && !sess.again) await maybeEnd(sess);
@@ -382,6 +401,11 @@ video.addEventListener('error', () => {
   const e = video.error;
   const detail = e ? `code ${e.code}${e.message ? ': ' + e.message : ''}` : 'unknown';
   console.error('Video error', detail, 'at', video.currentTime);
+  try {
+    const bb = S.sb.buffered, r = [];
+    for (let k = 0; k < bb.length; k++) r.push(bb.start(k).toFixed(2) + '-' + bb.end(k).toFixed(2));
+    console.error('Player state', { ms: S.ms.readyState, seg: idxAt(video.currentTime), now: (performance.now() / 1000).toFixed(1) + 's', buffered: r.join(' | '), recent: S.log });
+  } catch {}
   const d = dur();
   if (d && video.currentTime >= d - 2) recover({ t: 0, play: false, quiet: true });   // failed while draining at the very end
   else recover();
@@ -475,6 +499,12 @@ video.addEventListener('pause', poke);
 ['mousemove', 'pointerdown', 'touchstart'].forEach((ev) => wrap.addEventListener(ev, poke, { passive: true }));
 document.addEventListener('keydown', poke);
 setInterval(paint, 250);
+// If playback stalls right in front of a tiny hole in the buffer, hop over it.
+setInterval(() => {
+  if (!S || !S.ready || video.paused || video.seeking || pending !== null || video.readyState > 2) return;
+  const t = video.currentTime, b = video.buffered;
+  for (let k = 0; k < b.length; k++) if (b.start(k) > t && b.start(k) - t < 1.0) { video.currentTime = b.start(k) + 0.02; return; }
+}, 500);
 icons(); paint(); poke();
 
 route();
