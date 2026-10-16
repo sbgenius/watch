@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
 <meta name="referrer" content="no-referrer">
 <title>Video</title>
@@ -22,27 +22,32 @@ video{position:fixed;inset:0;width:100%;height:100dvh;background:#000;object-fit
 .load{position:fixed;left:50%;top:50%;width:48px;height:48px;margin:-24px 0 0 -24px;border:4px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;pointer-events:none;z-index:4;opacity:0;transition:opacity .3s;animation:ld-spin .9s linear infinite}
 .load.on{opacity:1}
 @keyframes ld-spin{to{transform:rotate(360deg)}}
-.wrap{position:fixed;inset:0;background:#000;user-select:none;-webkit-user-select:none}
+.wrap{position:fixed;inset:0;background:#000;user-select:none;-webkit-user-select:none;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 .wrap.idle{cursor:none}
-.ctl{position:fixed;left:0;right:0;bottom:0;padding:2.5rem 1rem .6rem;background:linear-gradient(transparent,rgba(0,0,0,.78));transition:opacity .25s;z-index:5}
+.ctl{position:fixed;left:0;right:0;bottom:0;padding:2.5rem max(1rem,env(safe-area-inset-right)) max(.6rem,env(safe-area-inset-bottom)) max(1rem,env(safe-area-inset-left));background:linear-gradient(transparent,rgba(0,0,0,.78));transition:opacity .25s;z-index:5}
 .wrap.idle .ctl{opacity:0;pointer-events:none}
-.bar{position:relative;height:16px;cursor:pointer;touch-action:none;display:flex;align-items:center}
+.bar{position:relative;height:28px;cursor:pointer;touch-action:none;display:flex;align-items:center}
 .bar::before{content:"";position:absolute;left:0;right:0;height:4px;background:rgba(255,255,255,.25);border-radius:2px;transition:height .1s}
 .bar i{position:absolute;left:0;height:4px;border-radius:2px;pointer-events:none;transition:height .1s}
 .bar:hover::before,.bar:hover i,.bar.drag::before,.bar.drag i{height:6px}
 #buf{background:rgba(255,255,255,.4)}#pl{background:#ff3d54}
-.knob{position:absolute;width:13px;height:13px;border-radius:50%;background:#ff3d54;transform:translateX(-50%) scale(0);transition:transform .1s;pointer-events:none}
-.bar:hover .knob,.bar.drag .knob{transform:translateX(-50%) scale(1)}
-.tip{position:absolute;bottom:22px;transform:translateX(-50%);background:rgba(0,0,0,.85);padding:.2rem .5rem;border-radius:4px;font-size:.75rem;display:none;pointer-events:none}
+.knob{position:absolute;width:13px;height:13px;border-radius:50%;background:#ff3d54;transform:translateX(-50%) scale(1);transition:transform .1s;pointer-events:none}
+.bar:hover .knob,.bar.drag .knob{transform:translateX(-50%) scale(1.25)}
+.tip{position:absolute;bottom:26px;transform:translateX(-50%);background:rgba(0,0,0,.85);padding:.2rem .5rem;border-radius:4px;font-size:.75rem;display:none;pointer-events:none}
 .bar:hover .tip,.bar.drag .tip{display:block}
 .row{display:flex;align-items:center;gap:.3rem;margin-top:.3rem}
-.row button{background:none;border:0;color:#fff;min-width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer}
+.row button{background:none;border:0;color:#fff;min-width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer}
 .row button:hover{background:rgba(255,255,255,.15)}
 .row svg{width:24px;height:24px;fill:currentColor}
 #bSpeed{padding:0 .7rem;border-radius:4px;font-size:.85rem;font-weight:600}
 #vol{width:70px;accent-color:#fff}
 #time{font-size:.82rem;font-variant-numeric:tabular-nums;margin-left:.5rem}
 .sp{flex:1}
+.cbtn{position:fixed;left:50%;top:50%;width:72px;height:72px;margin:-36px 0 0 -36px;border:0;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:5;transition:opacity .25s,background .15s;-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
+.cbtn:hover{background:rgba(0,0,0,.75)}
+.cbtn svg{width:36px;height:36px;fill:currentColor}
+.wrap.idle .cbtn,.wrap.busy .cbtn{opacity:0;pointer-events:none}
+@media (max-width:600px){#vol{display:none}.cbtn{width:64px;height:64px;margin:-32px 0 0 -32px}#time{margin-left:.2rem}}
 @keyframes float{50%{transform:translateY(-9px)}}
 @media (prefers-reduced-motion:reduce){*:not(.load){animation:none!important}.load{animation-duration:2.5s}}
 </style>
@@ -53,6 +58,7 @@ video{position:fixed;inset:0;width:100%;height:100dvh;background:#000;object-fit
   <video id="video" playsinline></video>
   <div class="note" id="note" role="status"></div>
   <div class="load" id="load" aria-hidden="true"></div>
+  <button class="cbtn" id="bCenter" aria-label="Play or pause"></button>
   <div class="ctl" id="ctl">
     <div class="bar" id="bar"><i id="buf"></i><i id="pl"></i><div class="knob" id="knob"></div><div class="tip" id="tip"></div></div>
     <div class="row">
@@ -453,13 +459,18 @@ let pending = null, drag = false, idleT;
 const dur = () => (S && S.man ? S.man.duration : hold ? hold.d : 0);
 const fmt = (s) => { s = Math.max(0, Math.floor(s || 0)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = String(s % 60).padStart(2, '0'); return h ? `${h}:${String(m).padStart(2, '0')}:${x}` : `${m}:${x}`; };
 const toggle = () => (video.paused ? video.play().catch(() => {}) : video.pause());
-const goFs = () => (document.fullscreenElement ? document.exitFullscreen() : wrap.requestFullscreen?.());
+const goFs = () => {
+  if (document.fullscreenElement) return document.exitFullscreen();
+  if (wrap.requestFullscreen) return wrap.requestFullscreen();
+  if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();   // iPhone Safari
+};
 
 const loader = $('#load');
 function busy() {   // spinner while opening, seeking, or starved for data
   const opening = S && !S.ready && !$('#note').classList.contains('bad');
   const starved = S && S.ready && !video.ended && video.readyState < 3 && (!video.paused || video.seeking || pending !== null);
   loader.classList.toggle('on', !!(opening || starved));
+  wrap.classList.toggle('busy', !!(opening || starved));
 }
 function paint() {
   if (hold && (Date.now() > hold.until || (S && S.ready && video.readyState >= 2))) hold = null;
@@ -473,7 +484,7 @@ function paint() {
   busy();
 }
 function icons() {
-  $('#bPlay').innerHTML = video.paused ? IC.play : IC.pause;
+  $('#bPlay').innerHTML = $('#bCenter').innerHTML = video.paused ? IC.play : IC.pause;
   $('#bMute').innerHTML = video.muted || video.volume === 0 ? IC.mute : IC.vol;
   $('#bSpeed').textContent = video.playbackRate + 'x';
 }
@@ -498,14 +509,23 @@ $('#bMute').onclick = () => { video.muted = !video.muted; };
 $('#vol').oninput = (e) => { video.volume = +e.target.value; video.muted = false; };
 $('#bSpeed').onclick = () => { video.playbackRate = SPEEDS[(SPEEDS.indexOf(video.playbackRate) + 1) % SPEEDS.length]; };
 $('#bFs').innerHTML = IC.fs; $('#bFs').onclick = goFs;
-video.addEventListener('click', toggle);
-video.addEventListener('dblclick', () => { toggle(); goFs(); });
+$('#bCenter').onclick = toggle;
+// Clicking the picture never pauses. Mouse: double-click = fullscreen. Touch: a tap shows/hides the controls.
+let lastPtr = 'mouse';
+wrap.addEventListener('pointerdown', (e) => { lastPtr = e.pointerType; }, { passive: true });
+wrap.addEventListener('click', (e) => {
+  if (e.target.closest('.ctl, .cbtn') || lastPtr !== 'touch' || video.paused) return;
+  if (wrap.classList.contains('idle')) poke(); else { clearTimeout(idleT); wrap.classList.add('idle'); }
+});
+video.addEventListener('dblclick', () => { if (lastPtr !== 'touch') goFs(); });
 
 ['play', 'pause', 'volumechange', 'ratechange'].forEach((ev) => video.addEventListener(ev, icons));
 ['timeupdate', 'progress', 'seeking', 'durationchange', 'loadedmetadata', 'waiting', 'playing', 'canplay', 'stalled'].forEach((ev) => video.addEventListener(ev, paint));
 video.addEventListener('seeked', () => { pending = null; paint(); });
 video.addEventListener('pause', poke);
-['mousemove', 'pointerdown', 'touchstart'].forEach((ev) => wrap.addEventListener(ev, poke, { passive: true }));
+video.addEventListener('play', poke);
+wrap.addEventListener('mousemove', poke, { passive: true });
+$('#ctl').addEventListener('pointerdown', poke, { passive: true });
 document.addEventListener('keydown', poke);
 setInterval(paint, 250);
 // If playback stalls right in front of a tiny hole in the buffer, hop over it.
